@@ -1,0 +1,370 @@
+#include <PID_v2.h>
+#include <max6675.h>
+
+// 热电偶引脚定义
+int SO_PIN_1 = 35;  // 第一个设备 Serial Out (SO) pin
+int CS_PIN_1 = 32;  // 第一个设备 Chip Select (CS) pin
+int SCK_PIN_1 = 33; // 第一个设备 Clock (SCK) pin
+
+int SO_PIN_2 = 21;  // 第二个设备 Serial Out (SO) pin
+int CS_PIN_2 = 19;  // 第二个设备 Chip Select (CS) pin
+int SCK_PIN_2 = 18; // 第二个设备 Clock (SCK) pin
+
+MAX6675 thermocouple1(SCK_PIN_1, CS_PIN_1, SO_PIN_1);
+MAX6675 thermocouple2(SCK_PIN_2, CS_PIN_2, SO_PIN_2);
+
+// 珀尔帖控制引脚定义
+#define enA 27 // 第一个设备 PWM 引脚
+#define in1 26
+#define in2 25
+
+#define enB 2  // 第二个设备 PWM 引脚
+#define in3 5
+#define in4 4
+
+int pwmOutput1 = 0; // 第一个设备 PWM 输出
+int pwmOutput2 = 0; // 第二个设备 PWM 输出
+
+double Input1, Input2;
+double targetTemperature = 36; // 初始目标温度
+double initialTemperature;     // 初始温度
+
+// PID 控制参数调整
+double Kp_1 = 50;
+double Ki_1 = 4;
+double Kd_1 = 3;
+
+PID_v2 myPID1(Kp_1, Ki_1, Kd_1, PID::Direct); // 第一个设备 PID 控制器
+PID_v2 myPID2(Kp_1, Ki_1, Kd_1, PID::Direct); // 第二个设备 PID 控制器
+
+// 摇杆和震动马达引脚定义
+#define VRx_PIN 34
+#define VRy_PIN 13
+#define SW_PIN 14
+#define MOTOR_PIN 22
+
+// 定义摇杆中值和阈值
+#define JOYSTICK_CENTER 2048
+#define JOYSTICK_THRESHOLD 1000
+
+bool joystickMoved = false;
+
+// 模式定义
+enum Mode {
+  MODE_MAINTAIN_36,
+  MODE_HEATING,
+  MODE_HOLDING,
+  MODE_WAVE_HEATING,
+  MODE_STOPPED // 停止模式
+};
+
+Mode currentMode = MODE_MAINTAIN_36;
+Mode nextMode;
+unsigned long modeStartTime;
+unsigned long holdingDuration = 300000; // 5 分钟
+unsigned long waveDuration = 300000;    // 5 分钟
+double waveRangeMin;
+double waveRangeMax;
+unsigned long wavePeriod = 30000; // 30 秒
+double wavePeriodSec = 30.0;      // 30 秒
+
+void setup()
+{
+  Serial.begin(9600);
+
+  // 第一个设备控制引脚
+  pinMode(enA, OUTPUT);
+  pinMode(in1, OUTPUT);
+  pinMode(in2, OUTPUT);
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+
+  // 第二个设备控制引脚
+  pinMode(enB, OUTPUT);
+  pinMode(in3, OUTPUT);
+  pinMode(in4, OUTPUT);
+  digitalWrite(in3, LOW);
+  digitalWrite(in4, LOW);
+
+  // 摇杆和震动马达引脚
+  pinMode(VRx_PIN, INPUT);
+  pinMode(VRy_PIN, INPUT);
+  pinMode(SW_PIN, INPUT_PULLUP); // SW 为高电平未按下
+  pinMode(MOTOR_PIN, OUTPUT);
+  digitalWrite(MOTOR_PIN, LOW); // 初始关闭马达
+
+  // 读取初始温度并设置设定点
+  Input1 = thermocouple1.readCelsius();
+  Input2 = thermocouple2.readCelsius();
+  initialTemperature = (Input1 + Input2) / 2; // 平均初始温度
+
+  myPID1.Start(Input1, 0, targetTemperature);
+  myPID2.Start(Input2, 0, targetTemperature);
+}
+
+void loop()
+{
+  // 读取摇杆数值
+  int vrxValue = analogRead(VRx_PIN);
+  int vryValue = analogRead(VRy_PIN);
+
+  // 摇杆移动检测（在任何模式下都检测）
+  if (!joystickMoved)
+  {
+    if (vrxValue < JOYSTICK_CENTER - JOYSTICK_THRESHOLD)
+    {
+      joystickMoved = true;
+      triggerMode(1); // 模式 1
+    }
+    else if (vrxValue > JOYSTICK_CENTER + JOYSTICK_THRESHOLD)
+    {
+      joystickMoved = true;
+      triggerMode(3); // 模式 3
+    }
+    else if (vryValue < JOYSTICK_CENTER - JOYSTICK_THRESHOLD)
+    {
+      joystickMoved = true;
+      triggerMode(2); // 模式 2
+    }
+    else if (vryValue > JOYSTICK_CENTER + JOYSTICK_THRESHOLD)
+    {
+      joystickMoved = true;
+      stopHeating(); // 停止加热
+    }
+  }
+  else
+  {
+    if (abs(vrxValue - JOYSTICK_CENTER) < JOYSTICK_THRESHOLD && abs(vryValue - JOYSTICK_CENTER) < JOYSTICK_THRESHOLD)
+    {
+      joystickMoved = false;
+    }
+  }
+
+  // 读取温度
+  Input1 = thermocouple1.readCelsius();
+  Input2 = thermocouple2.readCelsius();
+
+  // 处理当前模式
+  switch (currentMode)
+  {
+    case MODE_MAINTAIN_36:
+      maintainTemperature(36);
+      break;
+
+    case MODE_HEATING:
+      handleHeating();
+      break;
+
+    case MODE_HOLDING:
+      handleHolding();
+      break;
+
+    case MODE_WAVE_HEATING:
+      handleWaveHeating();
+      break;
+
+    case MODE_STOPPED:
+      // 停止模式，不进行任何操作
+      stopHeating();
+      break;
+  }
+
+  // 输出温度数据给 Serial Plotter
+  Serial.print("Device1:");
+  Serial.print(Input1);
+  Serial.print(" Device2:");
+  Serial.print(Input2);
+  Serial.print(" Setpoint:");
+  Serial.println(targetTemperature);
+
+  delay(200); // 稳定输出
+}
+
+void triggerMode(int mode)
+{
+  vibrateMotor(mode);
+
+  initialTemperature = (Input1 + Input2) / 2; // 重新获取当前温度
+  modeStartTime = millis();
+
+  if (mode == 1)
+  {
+    // 模式 1：加热到 40 度，恒温 5 分钟
+    targetTemperature = 40;
+    currentMode = MODE_HEATING;
+    nextMode = MODE_HOLDING;
+    holdingDuration = 300000; // 5 分钟
+    Serial.println("模式 1：加热到 40°C，保持 5 分钟");
+  }
+  else if (mode == 2)
+  {
+    // 模式 2：加热到 45 度，波动加热 5 分钟（40-45 度）
+    targetTemperature = 45;
+    currentMode = MODE_HEATING;
+    nextMode = MODE_WAVE_HEATING;
+    waveDuration = 300000; // 5 分钟
+    waveRangeMin = 40;
+    waveRangeMax = 45;
+    Serial.println("模式 2：加热到 45°C，波动加热 5 分钟（40°C - 45°C）");
+  }
+  else if (mode == 3)
+  {
+    // 模式 3：加热到 50 度，波动加热 5 分钟（45-50 度）
+    targetTemperature = 50;
+    currentMode = MODE_HEATING;
+    nextMode = MODE_WAVE_HEATING;
+    waveDuration = 300000; // 5 分钟
+    waveRangeMin = 45;
+    waveRangeMax = 50;
+    Serial.println("模式 3：加热到 50°C，波动加热 5 分钟（45°C - 50°C）");
+  }
+}
+
+void vibrateMotor(int times)
+{
+  for (int i = 0; i < times; i++)
+  {
+    digitalWrite(MOTOR_PIN, HIGH);
+    delay(200);
+    digitalWrite(MOTOR_PIN, LOW);
+    if (i < times - 1)
+    {
+      delay(200); // 震动间隔
+    }
+  }
+}
+
+void maintainTemperature(double setpoint)
+{
+  myPID1.Start(Input1, 0, setpoint);
+  myPID2.Start(Input2, 0, setpoint);
+
+  pwmOutput1 = constrain(myPID1.Run(Input1), 0, 255);
+  pwmOutput2 = constrain(myPID2.Run(Input2), 0, 255);
+
+  controlDevices(pwmOutput1, pwmOutput2, true);
+
+  // 精简输出
+  Serial.print("维持温度：设定 ");
+  Serial.print(setpoint);
+  Serial.print("°C，实际 ");
+  Serial.print((Input1 + Input2) / 2);
+  Serial.println("°C");
+}
+
+void handleHeating()
+{
+  unsigned long elapsedTime = (millis() - modeStartTime) / 1000; // 秒
+  double currentSetpoint = initialTemperature + elapsedTime * 1; // 1℃/s
+
+  if (currentSetpoint >= targetTemperature)
+  {
+    currentSetpoint = targetTemperature;
+    currentMode = nextMode;
+    modeStartTime = millis(); // 进入下一模式
+  }
+
+  myPID1.Start(Input1, 0, currentSetpoint);
+  myPID2.Start(Input2, 0, currentSetpoint);
+
+  pwmOutput1 = constrain(myPID1.Run(Input1), 0, 255);
+  pwmOutput2 = constrain(myPID2.Run(Input2), 0, 255);
+
+  controlDevices(pwmOutput1, pwmOutput2, true);
+
+  // 精简输出
+  Serial.print("加热中：设定 ");
+  Serial.print(currentSetpoint);
+  Serial.print("°C，实际 ");
+  Serial.print((Input1 + Input2) / 2);
+  Serial.println("°C");
+}
+
+void handleHolding()
+{
+  unsigned long elapsedTime = millis() - modeStartTime;
+  if (elapsedTime >= holdingDuration)
+  {
+    currentMode = MODE_MAINTAIN_36;
+    Serial.println("保持阶段结束，返回维持 36°C");
+  }
+  else
+  {
+    myPID1.Start(Input1, 0, targetTemperature);
+    myPID2.Start(Input2, 0, targetTemperature);
+
+    pwmOutput1 = constrain(myPID1.Run(Input1), 0, 255);
+    pwmOutput2 = constrain(myPID2.Run(Input2), 0, 255);
+
+    controlDevices(pwmOutput1, pwmOutput2, true);
+
+    // 精简输出
+    Serial.print("恒温保持：设定 ");
+    Serial.print(targetTemperature);
+    Serial.print("°C，实际 ");
+    Serial.print((Input1 + Input2) / 2);
+    Serial.println("°C");
+  }
+}
+
+void handleWaveHeating()
+{
+  unsigned long elapsedTime = millis() - modeStartTime;
+  if (elapsedTime >= waveDuration)
+  {
+    currentMode = MODE_MAINTAIN_36;
+    Serial.println("波动加热结束，返回维持 36°C");
+  }
+  else
+  {
+    double waveElapsedTime = (elapsedTime % wavePeriod) / 1000.0; // 秒
+    double tempAmplitude = (waveRangeMax - waveRangeMin) / 2;
+    double tempMidpoint = (waveRangeMax + waveRangeMin) / 2;
+    double waveSetpoint = tempMidpoint + tempAmplitude * sin(2 * PI * waveElapsedTime / wavePeriodSec);
+
+    myPID1.Start(Input1, 0, waveSetpoint);
+    myPID2.Start(Input2, 0, waveSetpoint);
+
+    pwmOutput1 = constrain(myPID1.Run(Input1), 0, 255);
+    pwmOutput2 = constrain(myPID2.Run(Input2), 0, 255);
+
+    controlDevices(pwmOutput1, pwmOutput2, true);
+
+    // 精简输出
+    Serial.print("波动加热：设定 ");
+    Serial.print(waveSetpoint);
+    Serial.print("°C，实际 ");
+    Serial.print((Input1 + Input2) / 2);
+    Serial.println("°C");
+  }
+}
+
+void controlDevices(int pwm1, int pwm2, bool heating)
+{
+  if (heating)
+  {
+    // 加热模式
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+    analogWrite(enA, pwm1);
+
+    digitalWrite(in3, LOW);
+    digitalWrite(in4, HIGH);
+    analogWrite(enB, pwm2);
+  }
+}
+
+void stopHeating()
+{
+  // 关闭所有输出
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+  analogWrite(enA, 0);
+
+  digitalWrite(in3, LOW);
+  digitalWrite(in4, LOW);
+  analogWrite(enB, 0);
+
+  currentMode = MODE_STOPPED; // 设置为停止模式
+  Serial.println("加热已停止");
+}
